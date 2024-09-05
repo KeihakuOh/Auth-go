@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -15,43 +16,42 @@ import (
 )
 
 const (
-	response_type = "code"
-	redirect_uri  = "http://localhost:8080/callback"
-	grant_type    = "authorization_code"
-
-	verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	responseType = "code"
+	redirectURI  = "http://localhost:8080/callback"
+	grantType    = "authorization_code"
 )
 
 var secrets map[string]interface{}
-
 var oauth struct {
-	clientId              string
-	clientSecret          string
-	scope                 string
-	state                 string
-	code_challenge_method string
-	code_challenge        string
-	authEndpoint          string
-	tokenEndpoint         string
+	clientId            string
+	clientSecret        string
+	scope               string
+	state               string
+	codeVerifier        string
+	codeChallengeMethod string
+	codeChallenge       string
+	authEndpoint        string
+	tokenEndpoint       string
 }
 
 func readJson() {
 	file, err := os.Open("client_secret.json")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to open client_secret.json: %v", err)
 	}
 	defer file.Close()
 
 	data, err := io.ReadAll(file)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to read client_secret.json: %v", err)
 	}
 
-	json.Unmarshal(data, &secrets)
+	if err := json.Unmarshal(data, &secrets); err != nil {
+		log.Fatalf("Failed to unmarshal JSON: %v", err)
+	}
 }
 
 func setUp() {
-
 	readJson()
 
 	oauth.clientId = secrets["web"].(map[string]interface{})["client_id"].(string)
@@ -60,13 +60,20 @@ func setUp() {
 	oauth.tokenEndpoint = "https://www.googleapis.com/oauth2/v4/token"
 	oauth.state = "xyz"
 	oauth.scope = "https://www.googleapis.com/auth/photoslibrary.appendonly" // スコープを設定
-	oauth.code_challenge_method = "S256"
-
-	// PKCE用に"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"をSHA256+Base64URLエンコードしたものをセット
-	oauth.code_challenge = base64URLEncode()
+	oauth.codeVerifier = generateCodeVerifier()
+	oauth.codeChallengeMethod = "S256"
+	oauth.codeChallenge = generateCodeChallenge(oauth.codeVerifier)
 }
 
-func base64URLEncode() string {
+func generateCodeVerifier() string {
+	verifier := make([]byte, 32)
+	if _, err := rand.Read(verifier); err != nil {
+		log.Fatalf("Failed to generate code verifier: %v", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(verifier)
+}
+
+func generateCodeChallenge(verifier string) string {
 	hash := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
@@ -75,41 +82,41 @@ func start(w http.ResponseWriter, req *http.Request) {
 	authEndpoint := oauth.authEndpoint
 
 	values := url.Values{}
-	values.Add("response_type", response_type)
+	values.Add("response_type", responseType)
 	values.Add("client_id", oauth.clientId)
 	values.Add("state", oauth.state)
 	values.Add("scope", oauth.scope)
-	values.Add("redirect_uri", redirect_uri)
+	values.Add("redirect_uri", redirectURI)
 
 	// PKCE用パラメータ
-	values.Add("code_challenge_method", oauth.code_challenge_method)
-	values.Add("code_challenge", oauth.code_challenge)
+	values.Add("code_challenge_method", oauth.codeChallengeMethod)
+	values.Add("code_challenge", oauth.codeChallenge)
 
 	// 認可エンドポイントにリダイレクト
-	http.Redirect(w, req, authEndpoint+values.Encode(), 302)
+	http.Redirect(w, req, authEndpoint+values.Encode(), http.StatusFound)
 }
 
 func callback(w http.ResponseWriter, req *http.Request) {
-	// クエリを取得
 	query := req.URL.Query()
 
-	// トークンをリクエストする
 	result, err := tokenRequest(query)
 	if err != nil {
-		log.Println(err)
+		log.Printf("Failed to request token: %v", err)
+		http.Error(w, "Failed to request token", http.StatusInternalServerError)
+		return
 	}
 	accessToken := result["access_token"].(string)
 
-	// 画像をアップロードしてGoogle Photosに追加する
-	uploadToken, err := uploadPhoto(accessToken, "test.jpg") // "test.jpg"は追加したい画像のパス
+	uploadToken, err := uploadPhoto(accessToken, "test.jpg")
 	if err != nil {
-		log.Println("Failed to upload photo:", err)
+		log.Printf("Failed to upload photo: %v", err)
+		http.Error(w, "Failed to upload photo", http.StatusInternalServerError)
 		return
 	}
 
-	err = addPhotoToLibrary(accessToken, uploadToken)
-	if err != nil {
-		log.Println("Failed to add photo to library:", err)
+	if err := addPhotoToLibrary(accessToken, uploadToken); err != nil {
+		log.Printf("Failed to add photo to library: %v", err)
+		http.Error(w, "Failed to add photo to library", http.StatusInternalServerError)
 		return
 	}
 
@@ -117,48 +124,44 @@ func callback(w http.ResponseWriter, req *http.Request) {
 }
 
 func tokenRequest(query url.Values) (map[string]interface{}, error) {
-	tokenEndpoint := oauth.tokenEndpoint
 	values := url.Values{}
 	values.Add("client_id", oauth.clientId)
 	values.Add("client_secret", oauth.clientSecret)
-	values.Add("grant_type", grant_type)
-
-	// 取得した認可コードをトークンのリクエストにセット
+	values.Add("grant_type", grantType)
 	values.Add("code", query.Get("code"))
-	values.Add("redirect_uri", redirect_uri)
+	values.Add("redirect_uri", redirectURI)
+	values.Add("code_verifier", oauth.codeVerifier)
 
-	// PKCE用パラメータ
-	values.Add("code_verifier", verifier)
-
-	req, err := http.NewRequest("POST", tokenEndpoint, strings.NewReader(values.Encode()))
+	req, err := http.NewRequest("POST", oauth.tokenEndpoint, strings.NewReader(values.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("request err: %s", err)
-		return nil, err
+		return nil, fmt.Errorf("failed to send token request: %w", err)
 	}
 	defer resp.Body.Close()
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
 
-	log.Printf("token response : %s", string(body))
 	var data map[string]interface{}
-	json.Unmarshal(body, &data)
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal token response: %w", err)
+	}
 
 	return data, nil
 }
 
-// 写真をGoogle Photos APIのuploadsエンドポイントにアップロードし、uploadTokenを取得する関数
 func uploadPhoto(accessToken, filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
@@ -166,29 +169,28 @@ func uploadPhoto(accessToken, filePath string) (string, error) {
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", uploadURL, file)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create upload request: %w", err)
 	}
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Goog-Upload-File-Name", "test.jpg") // アップロードするファイル名を設定
+	req.Header.Set("X-Goog-Upload-File-Name", "test.jpg")
 	req.Header.Set("X-Goog-Upload-Protocol", "raw")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to upload photo: %w", err)
 	}
 	defer resp.Body.Close()
 
 	uploadToken, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read upload response: %w", err)
 	}
 
 	return string(uploadToken), nil
 }
 
-// uploadTokenを使って写真をGoogle Photosライブラリに追加する関数
 func addPhotoToLibrary(accessToken, uploadToken string) error {
 	batchCreateURL := "https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate"
 
@@ -207,7 +209,7 @@ func addPhotoToLibrary(accessToken, uploadToken string) error {
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", batchCreateURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create add photo request: %w", err)
 	}
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
@@ -215,13 +217,13 @@ func addPhotoToLibrary(accessToken, uploadToken string) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to add photo to library: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read add photo response: %w", err)
 	}
 
 	log.Printf("Add photo response: %s", string(body))
@@ -233,8 +235,7 @@ func main() {
 	http.HandleFunc("/start", start)
 	http.HandleFunc("/callback", callback)
 	log.Println("start server localhost:8080...")
-	err := http.ListenAndServe("localhost:8080", nil)
-	if err != nil {
-		log.Fatal(err)
+	if err := http.ListenAndServe("localhost:8080", nil); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
 	}
 }
