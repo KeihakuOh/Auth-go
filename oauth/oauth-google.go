@@ -107,7 +107,7 @@ func callback(w http.ResponseWriter, req *http.Request) {
 	}
 	accessToken := result["access_token"].(string)
 
-	uploadToken, err := uploadPhoto(accessToken, "test.jpg")
+	uploadToken, err := uploadPhoto(accessToken, "image1.jpg")
 	if err != nil {
 		log.Printf("Failed to upload photo: %v", err)
 		http.Error(w, "Failed to upload photo", http.StatusInternalServerError)
@@ -174,7 +174,7 @@ func uploadPhoto(accessToken, filePath string) (string, error) {
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Goog-Upload-File-Name", "test.jpg")
+	req.Header.Set("X-Goog-Upload-File-Name", "image1.jpg")
 	req.Header.Set("X-Goog-Upload-Protocol", "raw")
 
 	resp, err := client.Do(req)
